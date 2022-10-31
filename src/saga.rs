@@ -1,3 +1,4 @@
+use std::any::type_name;
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
@@ -14,19 +15,18 @@ use time::OffsetDateTime;
 use serde::{Serialize, Deserialize, de::DeserializeOwned};
 use serde_json::Error;
 
-pub trait WorkflowTrait {
-    const NAME: &'static str;
+pub trait Workflow : Send {
     type Input: Serialize + DeserializeOwned;
     type Output: Serialize + DeserializeOwned;
 
     fn start(
+        self,
         state: Arc<Mutex<WorkflowState>>,
         input: Self::Input,
     ) -> BoxFuture<'static, WorkflowResult<()>>;
 }
 
 pub trait ActionRequest : Serialize + DeserializeOwned {
-    const TYPE_NAME: &'static str;
     type Response : Serialize + DeserializeOwned;
 }
 
@@ -59,7 +59,7 @@ impl<A: ActionRequest + Unpin> Future for ActionFuture<A> {
     fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let mut state = this.state.lock().unwrap();
-        let expected_type = A::TYPE_NAME;
+        let expected_type = type_name::<A>();
         let expected_id = this.action_id;
         match state.actions.pop_response(expected_type, expected_id)? {
             Some(output) => {
@@ -174,7 +174,7 @@ impl WorkflowState {
         action_id: ActionRequestId,
         response: A::Response,
     ) -> WorkflowResult<()> {
-        let response = (A::TYPE_NAME, action_id, serde_json::to_string(&response).unwrap());
+        let response = (type_name::<A>(), action_id, serde_json::to_string(&response).unwrap());
         self.record_new_revision(now, Event::ActionResponse(response.clone()));
         self.actions.apply_response(response)?;
         Ok(())
@@ -205,18 +205,19 @@ impl WorkflowState {
         request: A,
     ) -> Result<ActionRequestId, WorkflowError> {
         let request = serde_json::to_string(&request).unwrap();
-        let action_id = self.actions.new_request(A::TYPE_NAME);
-        let event = Event::ActionRequested((A::TYPE_NAME, action_id, request));
+        let action_id = self.actions.new_request(type_name::<A>());
+        let event = Event::ActionRequested((type_name::<A>(), action_id, request));
         self.record_event(event)?;
         Ok(action_id)
 
     }
 
-    pub fn record_workflow_result(
+    pub fn record_workflow_result<Out: Serialize>(
         &mut self,
-        result: WorkflowResult<String>,
+        result: WorkflowResult<Out>,
     ) -> WorkflowResult<()> {
-        self.record_event(Event::Finished(result))
+        let finished = result.map(|output|serde_json::to_string(&output).unwrap());
+        self.record_event(Event::Finished(finished))
     }
 
     pub fn drain_pending_events(&mut self) -> Vec<EventRecord> {
@@ -342,18 +343,20 @@ pub struct WorkflowExecution {
 }
 
 impl WorkflowExecution {
-    pub fn start<W: WorkflowTrait>(now: time::OffsetDateTime, input: W::Input) -> WorkflowResult<Self> {
+    pub fn start<In: Serialize, Out, W: IntoWorkflow<In, Out>>( workflow: W, now: time::OffsetDateTime, input: In) -> WorkflowResult<Self> {
+        let workflow = IntoWorkflow::into_workflow(workflow);
         let started = serde_json::to_string(&input).unwrap();
         let state = WorkflowState::start(now, started);
-        Self::new::<W>(state, input)
+        Self::new(workflow, state, input)
     }
 
-    pub fn replay<W: WorkflowTrait>(mut replay: VecDeque<EventRecord>) -> WorkflowResult<Self> {
+    pub fn replay<In: DeserializeOwned, Out, W: IntoWorkflow<In, Out>>(workflow: W, mut replay: VecDeque<EventRecord>) -> WorkflowResult<Self> {
+        let workflow = IntoWorkflow::into_workflow(workflow);
         match replay.pop_front() {
             Some((0, 0, now, Event::Started(started))) => {
                 let input = serde_json::from_str(started.as_str())?;
                 let state = WorkflowState::replay(now, replay);
-                Self::new::<W>(state, input)
+                Self::new(workflow, state, input)
             }
             Some(actual) => Err(WorkflowError::StartFailed { actual: Box::new(actual) }),
             None => Err(WorkflowError::Panic(None)),
@@ -374,8 +377,8 @@ impl WorkflowExecution {
         self.state.lock().unwrap().drain_pending_events()
     }
 
-    fn new<W: WorkflowTrait>(state: Arc<Mutex<WorkflowState>>, input: W::Input) -> Result<WorkflowExecution, WorkflowError> {
-        let mut future = WorkflowFuture::new::<W>(state.clone(), input)?;
+    fn new<W: Workflow>(workflow: W, state: Arc<Mutex<WorkflowState>>, input: W::Input) -> Result<WorkflowExecution, WorkflowError> {
+        let mut future = WorkflowFuture::new::<W>(workflow,state.clone(), input)?;
         future.resume_execution()?;
         Ok(Self {
             state,
@@ -390,10 +393,10 @@ pub struct WorkflowFuture {
 }
 
 impl WorkflowFuture {
-    pub fn new<W:WorkflowTrait>(state: Arc<Mutex<WorkflowState>>, input: W::Input) -> WorkflowResult<Self> {
+    pub fn new<W: Workflow>(workflow: W, state: Arc<Mutex<WorkflowState>>, input: W::Input) -> WorkflowResult<Self> {
         let mut future = Self {
             waker: Arc::new(EmptyWaker),
-            future: Mutex::new(W::start(state.clone(), input)),
+            future: Mutex::new(workflow.start(state.clone(), input)),
         };
         future.resume_execution()?;
         Ok(future)
@@ -431,10 +434,53 @@ impl WorkflowContext {
     }
 }
 
+pub trait IntoWorkflow<In, Out>: Sized {
+     type Workflow: Workflow<Input = In, Output = Out>;
+     /// Turns this value into its corresponding [`Workflow`].
+     fn into_workflow(this: Self) -> Self::Workflow;
+}
+
+impl<In, Out, Fut, Func> IntoWorkflow<In, Out> for Func
+    where In: Serialize + DeserializeOwned + Send + 'static,
+          Out: Serialize + DeserializeOwned,
+          Fut: Future<Output=WorkflowResult<Out>> + Send,
+          Func: Send + Sync + 'static + Fn(WorkflowContext, In) -> Fut,
+{
+    type Workflow = FunctionWorkflow<In, Out, Func>;
+
+    fn into_workflow(func: Self) -> Self::Workflow {
+        FunctionWorkflow { func, marker: Default::default() }
+    }
+}
+
+pub struct FunctionWorkflow<In, Out, Func>
+{
+    func: Func,
+    // NOTE: PhantomData<fn()-> T> gives this safe Send/Sync impls
+    marker: PhantomData<fn() -> (In, Out)>,
+}
+
+impl<In, Out, Fut, Func> Workflow for FunctionWorkflow<In, Out, Func>
+    where In: Serialize + DeserializeOwned + Send + 'static,
+          Out: Serialize + DeserializeOwned,
+          Fut: Future<Output=WorkflowResult<Out>> + Send,
+          Func: Send + Sync + 'static + Fn(WorkflowContext, In) -> Fut,
+{
+    type Input = In;
+    type Output = Out;
+
+    fn start(self, state: Arc<Mutex<WorkflowState>>, input: Self::Input) -> BoxFuture<'static, WorkflowResult<()>> {
+        async move {
+            let context = WorkflowContext::new(state.clone());
+            let result = (self.func)(context, input).await;
+            state.lock().unwrap().record_workflow_result(result)
+        }.boxed()
+    }
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct TimerRequest(time::Duration);
 impl ActionRequest for TimerRequest {
-    const TYPE_NAME: &'static str = "timer";
     type Response = ();
 }
 
@@ -446,80 +492,54 @@ mod tests {
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct HttpRequest(String);
-
     impl ActionRequest for HttpRequest {
-        const TYPE_NAME: &'static str = "http";
         type Response = String;
     }
 
-    #[derive(Debug, PartialEq)]
-    struct TestWorkflow;
-
-    impl WorkflowTrait for TestWorkflow {
-        const NAME: &'static str = "test-workflow";
-        type Input = usize;
-        type Output = usize;
-
-        fn start(
-            state: Arc<Mutex<WorkflowState>>,
-            request: Self::Input,
-        ) -> BoxFuture<'static, WorkflowResult<()>> {
-            let future = async move {
-                let mut context = WorkflowContext::new(state.clone());
-                let result = Self::execute(&mut context, request).await.map(|x| serde_json::to_string(&x).unwrap());
-                let result = context.0.lock().unwrap().record_workflow_result(result);
-                result
-            };
-            future.boxed()
-        }
-    }
-
-    impl TestWorkflow {
-        pub async fn execute(
-            context: &mut WorkflowContext,
-            request: usize,
-        ) -> WorkflowResult<usize> {
-            let eval1 = context.eval(|| 666)?;
-            let wait1 = context.wait(time::Duration::days(1));
-            let http_response = context.send(HttpRequest(format!("{request} {eval1}")));
-            let _ = wait1.await;
-            let wait2 = context.wait(time::Duration::days(2));
-            let _ = wait2.await;
-            let eval2 = context.eval(|| 100usize)?;
-            http_response.await.map(|x| x.len() + eval2)
-        }
+    pub async fn test_workflow(
+        mut context: WorkflowContext,
+        request: usize,
+    ) -> WorkflowResult<usize> {
+        let eval1 = context.eval(|| 666 )?;
+        let wait1 = context.wait(time::Duration::days(1));
+        let http_response = context.send(HttpRequest(format!("{request} {eval1}")));
+        wait1.await?;
+        let wait2 = context.wait(time::Duration::days(2));
+        wait2.await?;
+        let eval2 = context.eval(|| 100usize )?;
+        http_response.await.map(|r| r.len() + eval2)
     }
 
     #[test]
     #[rustfmt::skip]
     fn start() {
         let now = time::OffsetDateTime::now_utc();
-        let mut execution = WorkflowExecution::start::<TestWorkflow>(now, 42).unwrap();
+        let mut execution = WorkflowExecution::start( test_workflow, now, 42).unwrap();
         assert_eq!(execution.drain_pending_events(), vec![
             (0, 0, now, Event::Started("42".to_owned())),
             (1, 0, now, Event::Evaluated((0, "666".to_owned()))),
-            (2, 0, now, Event::ActionRequested(("timer", 0, "[86400,0]".to_owned()))),
-            (3, 0, now, Event::ActionRequested(("http", 1, "\"42 666\"".to_owned()))),
+            (2, 0, now, Event::ActionRequested(("async_workflow::saga::TimerRequest", 0, "[86400,0]".to_owned()))),
+            (3, 0, now, Event::ActionRequested(("async_workflow::saga::tests::HttpRequest", 1, "\"42 666\"".to_owned()))),
         ]);
 
         let now = now + time::Duration::seconds(1);
         assert_eq!(execution.handle_action_response::<TimerRequest>(now, 0, ()), Ok(()));
         assert_eq!(execution.drain_pending_events(), vec![
-            (4, 1, now, Event::ActionResponse(("timer", 0, "null".to_owned()))),
-            (5, 1, now, Event::ActionRequested(("timer", 2, "[172800,0]".to_owned()))),
+            (4, 1, now, Event::ActionResponse(("async_workflow::saga::TimerRequest", 0, "null".to_owned()))),
+            (5, 1, now, Event::ActionRequested(("async_workflow::saga::TimerRequest", 2, "[172800,0]".to_owned()))),
         ]);
 
         let now = now + time::Duration::seconds(1);
         assert_eq!(execution.handle_action_response::<TimerRequest>(now, 2, ()), Ok(()));
         assert_eq!(execution.drain_pending_events(), vec![
-            (6, 2, now, Event::ActionResponse(("timer", 2, "null".to_owned()))),
+            (6, 2, now, Event::ActionResponse(("async_workflow::saga::TimerRequest", 2, "null".to_owned()))),
             (7, 2, now, Event::Evaluated((1, "100".to_owned()))),
         ]);
 
         let now = now + time::Duration::seconds(1);
         assert_eq!(execution.handle_action_response::<HttpRequest>(now, 1, "24".to_owned()), Ok(()));
         assert_eq!(execution.drain_pending_events(), vec![
-            (8, 3, now, Event::ActionResponse(("http", 1, "\"24\"".to_owned()))),
+            (8, 3, now, Event::ActionResponse(("async_workflow::saga::tests::HttpRequest", 1, "\"24\"".to_owned()))),
             (9, 3, now, Event::Finished(Ok("102".to_owned()))),
         ]);
     }
@@ -527,13 +547,13 @@ mod tests {
     #[test]
     fn replay() {
         let now = time::OffsetDateTime::now_utc();
-        let mut execution = WorkflowExecution::replay::<TestWorkflow>([
+        let mut execution = WorkflowExecution::replay(test_workflow, [
             (0, 0, now, Event::Started("42".to_owned())),
             (1, 0, now, Event::Evaluated((0, "666".to_owned()))),
-            (2, 0, now, Event::ActionRequested(("timer", 0, "[86400,0]".to_owned()))),
-            (3, 0, now, Event::ActionRequested(("http", 1, "\"42 666\"".to_owned()))),
-            (4, 1, now, Event::ActionResponse(("timer", 0, "null".to_owned()))),
-            (5, 1, now, Event::ActionRequested(("timer", 2, "[172800,0]".to_owned()))),
+            (2, 0, now, Event::ActionRequested(("async_workflow::saga::TimerRequest", 0, "[86400,0]".to_owned()))),
+            (3, 0, now, Event::ActionRequested(("async_workflow::saga::tests::HttpRequest", 1, "\"42 666\"".to_owned()))),
+            (4, 1, now, Event::ActionResponse(("async_workflow::saga::TimerRequest", 0, "null".to_owned()))),
+            (5, 1, now, Event::ActionRequested(("async_workflow::saga::TimerRequest", 2, "[172800,0]".to_owned()))),
         ].into()).unwrap();
 
         assert_eq!(execution.drain_pending_events(), vec![]);
@@ -542,16 +562,16 @@ mod tests {
     #[test]
     fn replay_all() {
         let now = time::OffsetDateTime::now_utc();
-        let mut execution = WorkflowExecution::replay::<TestWorkflow>([
+        let mut execution = WorkflowExecution::replay(test_workflow, [
             (0, 0, now, Event::Started("42".to_owned())),
             (1, 0, now, Event::Evaluated((0, "666".to_owned()))),
-            (2, 0, now, Event::ActionRequested(("timer", 0, "[86400,0]".to_owned()))),
-            (3, 0, now, Event::ActionRequested(("http", 1, "\"42 666\"".to_owned()))),
-            (4, 1, now, Event::ActionResponse(("timer", 0, "null".to_owned()))),
-            (5, 1, now, Event::ActionRequested(("timer", 2, "[172800,0]".to_owned()))),
-            (6, 2, now, Event::ActionResponse(("timer", 2, "null".to_owned()))),
+            (2, 0, now, Event::ActionRequested(("async_workflow::saga::TimerRequest", 0, "[86400,0]".to_owned()))),
+            (3, 0, now, Event::ActionRequested(("async_workflow::saga::tests::HttpRequest", 1, "\"42 666\"".to_owned()))),
+            (4, 1, now, Event::ActionResponse(("async_workflow::saga::TimerRequest", 0, "null".to_owned()))),
+            (5, 1, now, Event::ActionRequested(("async_workflow::saga::TimerRequest", 2, "[172800,0]".to_owned()))),
+            (6, 2, now, Event::ActionResponse(("async_workflow::saga::TimerRequest", 2, "null".to_owned()))),
             (7, 2, now, Event::Evaluated((1, "100".to_owned()))),
-            (8, 3, now, Event::ActionResponse(("http", 1, "\"24\"".to_owned()))),
+            (8, 3, now, Event::ActionResponse(("async_workflow::saga::tests::HttpRequest", 1, "\"24\"".to_owned()))),
             (9, 3, now, Event::Finished(Ok("102".to_owned()))),
         ].into()).unwrap();
 
