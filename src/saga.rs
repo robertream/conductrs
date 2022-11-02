@@ -576,14 +576,6 @@ impl WorkflowContext {
         Self(state)
     }
 
-    pub fn wait(&mut self, duration: time::Duration) -> ActionFuture<TimerRequest> {
-        self.send(TimerRequest(duration))
-    }
-
-    pub fn send<A: ActionRequest>(&mut self, request: A) -> ActionFuture<A> {
-        ActionFuture::<A>::new(self.0.clone(), request)
-    }
-
     pub fn eval<T: Serialize + DeserializeOwned>(
         &mut self,
         evaluate: impl FnOnce() -> T,
@@ -660,12 +652,6 @@ where
         }
         .boxed()
     }
-}
-
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub struct TimerRequest(time::Duration);
-impl ActionRequest for TimerRequest {
-    type Response = ();
 }
 
 #[cfg(test)]
