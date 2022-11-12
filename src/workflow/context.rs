@@ -1,19 +1,17 @@
 use std::any::type_name;
 use std::future::Future;
 use std::marker::PhantomData;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 
-use super::state::{Event, WorkflowState};
+use super::action::{ActionFuture, ActionRequest};
+use super::state::WorkflowState;
 use super::WorkflowResult;
 
-pub struct WorkflowContext(pub(crate) Arc<Mutex<WorkflowState>>);
+pub struct WorkflowContext(pub(crate) WorkflowState);
 
 impl WorkflowContext {
-    pub fn new(state: Arc<Mutex<WorkflowState>>) -> Self {
+    pub fn new(state: WorkflowState) -> Self {
         Self(state)
     }
 
@@ -23,8 +21,6 @@ impl WorkflowContext {
     ) -> WorkflowResult<T> {
         let evaluation = self
             .0
-            .lock()
-            .unwrap()
             .record_eval(|| serde_json::to_string(&evaluate()).unwrap());
         Ok(serde_json::from_str(&evaluation?)?)
     }
@@ -34,14 +30,15 @@ impl WorkflowContext {
         _: Func,
     ) -> impl Fn(In) -> ActionFuture<FunctionActionRequest<Func, In, Out>>
     where
-        In: Serialize + DeserializeOwned,
-        Out: Serialize + DeserializeOwned,
-        Func: ActionFnImport<Ctx, In, Out>,
+        for<'a> In: Serialize + DeserializeOwned + 'a,
+        for<'a> Out: Serialize + DeserializeOwned + Send + 'a,
+        for<'a> Func: ActionFnImport<Ctx, In, Out> + 'a,
     {
         let state = self.0.clone();
         move |input| {
             let request = FunctionActionRequest(input, Default::default(), Default::default());
-            ActionFuture::new(state.clone(), request)
+            let (result, drop_handler) = state.record_action_request(request);
+            ActionFuture::new(result, drop_handler)
         }
     }
 }
@@ -58,79 +55,13 @@ where
     type Output = Fut;
 }
 
-pub trait ActionRequest: Serialize + DeserializeOwned {
-    type Response: Serialize + DeserializeOwned;
-    fn type_name() -> &'static str {
-        type_name::<Self>()
-    }
-}
-
-pub struct ActionFuture<A: ActionRequest> {
-    action_id: u32,
-    state: Arc<Mutex<WorkflowState>>,
-    phantom: PhantomData<A>,
-}
-
-impl<A: ActionRequest> ActionFuture<A> {
-    pub fn new(state: Arc<Mutex<WorkflowState>>, request: A) -> ActionFuture<A> {
-        let request = serde_json::to_string(&request).unwrap();
-        let action_id = state
-            .lock()
-            .unwrap()
-            .record_action_request(A::type_name(), request)
-            // TODO: maybe don't panic on failure?
-            //  but do we want replay failure to show up in the signature of all async functions in a workflow?
-            .expect("ActivityFuture");
-        Self {
-            action_id,
-            state,
-            phantom: Default::default(),
-        }
-    }
-}
-
-impl<A: ActionRequest + Unpin> Future for ActionFuture<A> {
-    type Output = WorkflowResult<A::Response>;
-
-    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        let mut state = this.state.lock().unwrap();
-        let expected_type = A::type_name();
-        let expected_id = this.action_id;
-        match state.actions.pop_response(expected_type, expected_id)? {
-            Some(output) => {
-                let output = output.as_str();
-                let output = serde_json::from_str::<A::Response>(output).unwrap();
-                Poll::Ready(Ok(output))
-            }
-            _ => Poll::Pending,
-        }
-    }
-}
-
-impl<A: ActionRequest> Drop for ActionFuture<A> {
-    // TODO: save any errors to self.state in order to return the error on the next Future::poll
-    fn drop(&mut self) {
-        let mut state = self.state.lock().unwrap();
-        if state
-            .actions
-            .drop_action(A::type_name(), self.action_id)
-            .unwrap()
-        {
-            state
-                .record_event(Event::ActionDropped((A::type_name(), self.action_id)))
-                .unwrap();
-        }
-    }
-}
-
 pub struct FunctionActionRequest<
     Func,
     In: Serialize + DeserializeOwned,
-    Out: Serialize + DeserializeOwned,
+    Out: Serialize + DeserializeOwned + Send,
 >(In, PhantomData<Func>, PhantomData<Out>);
 
-impl<Func, In: Serialize + DeserializeOwned, Out: Serialize + DeserializeOwned> ActionRequest
+impl<Func, In: Serialize + DeserializeOwned, Out: Serialize + DeserializeOwned + Send> ActionRequest
     for FunctionActionRequest<Func, In, Out>
 {
     type Response = Out;
@@ -139,7 +70,7 @@ impl<Func, In: Serialize + DeserializeOwned, Out: Serialize + DeserializeOwned> 
     }
 }
 
-impl<Func, In: Serialize + DeserializeOwned, Out: Serialize + DeserializeOwned> Serialize
+impl<Func, In: Serialize + DeserializeOwned, Out: Serialize + DeserializeOwned + Send> Serialize
     for FunctionActionRequest<Func, In, Out>
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -150,7 +81,7 @@ impl<Func, In: Serialize + DeserializeOwned, Out: Serialize + DeserializeOwned> 
     }
 }
 
-impl<'de, Func, In: Serialize + DeserializeOwned, Out: Serialize + DeserializeOwned>
+impl<'de, Func, In: Serialize + DeserializeOwned, Out: Serialize + DeserializeOwned + Send>
     Deserialize<'de> for FunctionActionRequest<Func, In, Out>
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

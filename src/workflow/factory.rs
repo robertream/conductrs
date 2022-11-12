@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use crate::workflow::events::EventQueue;
 use futures::future::BoxFuture;
 use futures::task::{waker_ref, ArcWake};
 use futures::FutureExt;
@@ -12,7 +13,8 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use super::actions::ActionRequestId;
 use super::context::WorkflowContext;
-use super::state::{Event, EventRecord, WorkflowState};
+use super::events::{Event, EventRecord};
+use super::state::WorkflowState;
 use super::{WorkflowError, WorkflowResult};
 
 pub struct WorkflowFactory<'a>(BoxWorkflowFn<'a>);
@@ -49,7 +51,7 @@ impl<'a> WorkflowFactory<'a> {
                     let input = serde_json::from_str::<In>(&started)?;
                     let result = func.call(&mut context, input).await;
                     let finished = result.map(|output| serde_json::to_string(&output).unwrap());
-                    context.0.lock().unwrap().record_workflow_result(finished)
+                    context.0.record_workflow_result(finished)
                 }
                 .boxed(),
             );
@@ -75,34 +77,35 @@ impl<'a> WorkflowFactory<'a> {
 pub struct Workflow<'a> {
     future: BoxWorkflowFuture<'a>,
     waker: Arc<EmptyWaker>,
-    state: Arc<Mutex<WorkflowState>>,
+    state: WorkflowState,
 }
 
 impl<'a> Workflow<'a> {
     pub fn apply(&mut self, event: EventRecord) -> WorkflowResult<()> {
-        self.state.lock().unwrap().apply(event);
+        self.state.apply(event);
         self.resume()
     }
 
     pub fn handle_action_response(
         &mut self,
         now: time::OffsetDateTime,
-        action_type: &str,
+        action_type: &'static str,
         action_id: ActionRequestId,
         response: String,
     ) -> WorkflowResult<()> {
         self.state
-            .lock()
-            .unwrap()
             .handle_action_response(now, action_type, action_id, response)?;
         self.resume()
     }
 
-    pub fn drain_pending_events(&mut self) -> Vec<EventRecord> {
-        self.state.lock().unwrap().drain_pending_events()
+    pub fn drain_pending_events(&mut self) -> EventQueue {
+        self.state.drain_pending_events()
     }
 
     fn resume(&self) -> WorkflowResult<()> {
+        if let Some(error) = self.state.pop_error() {
+            return Err(error);
+        }
         let waker = waker_ref(&self.waker);
         let mut future = self.future.lock().unwrap();
         let cx = &mut Context::from_waker(&*waker);

@@ -1,12 +1,17 @@
+pub mod action;
 pub mod actions;
 pub mod context;
+pub mod events;
 pub mod factory;
 pub mod state;
 
-use state::{EventId, EventRecord};
+#[cfg(test)]
+pub mod test;
 
 pub use context::WorkflowContext;
 pub use factory::WorkflowFactory;
+
+use events::{EventId, EventRecord};
 
 pub type WorkflowResult<T> = Result<T, WorkflowError>;
 
@@ -31,58 +36,11 @@ impl From<serde_json::Error> for WorkflowError {
 #[cfg(test)]
 mod tests {
     use pretty_assertions_sorted::assert_eq;
-    use reqwest::Url;
 
-    use super::state::Event;
     use super::*;
     use crate::actions::action_type_name;
-
-    struct Time;
-    impl Time {
-        async fn sleep(&self, duration: time::Duration) -> () {
-            tokio::time::sleep(duration.try_into().unwrap()).await
-        }
-    }
-
-    #[derive(Clone)]
-    struct HttpService(Url);
-    impl HttpService {
-        async fn put(&self, (id, state): (u32, String)) -> String {
-            let url = self
-                .0
-                .join(&id.to_string())
-                .map_err(|e| e.to_string())
-                .unwrap();
-            match reqwest::Client::new()
-                .put(url)
-                .body(state.clone())
-                .send()
-                .await
-                .map_err(|e| e.to_string())
-            {
-                Ok(_) => state,
-                Err(e) => e,
-            }
-        }
-    }
-
-    pub async fn test_workflow(
-        context: &mut WorkflowContext,
-        request: usize,
-    ) -> WorkflowResult<usize> {
-        let days = time::Duration::days;
-        let sleep = context.import(Time::sleep);
-        let http_put = context.import(HttpService::put);
-        let eval1 = context.eval(|| 666)?;
-        let wait1 = sleep(days(1));
-        let http_response = http_put((42, format!("{request} {eval1}")));
-        wait1.await?;
-        let wait2 = sleep(days(2));
-        wait2.await?;
-        let eval2 = context.eval(|| 100usize)?;
-        std::mem::drop(sleep(days(3)));
-        http_response.await.map(|r| r.len() + eval2)
-    }
+    use crate::workflow::events::Event;
+    use crate::workflow::test::*;
 
     #[test]
     #[rustfmt::skip]
@@ -90,7 +48,7 @@ mod tests {
         let time_sleep_name = action_type_name(Time::sleep);
         let http_put_name = action_type_name(HttpService::put);
         let now = time::OffsetDateTime::now_utc();
-        let factory = WorkflowFactory::new(test_workflow);
+        let factory = WorkflowFactory::new(test::test_workflow);
 
         let mut workflow = factory.start(now, "42".to_string()).unwrap();
         assert_eq!(workflow.drain_pending_events(), vec![
@@ -130,7 +88,7 @@ mod tests {
         let time_sleep_name = action_type_name(Time::sleep);
         let http_put_name = action_type_name(HttpService::put);
         let now = time::OffsetDateTime::now_utc();
-        let factory = WorkflowFactory::new(test_workflow);
+        let factory = WorkflowFactory::new(test::test_workflow);
 
         let mut workflow = factory.replay([
             (0, 0, now, Event::Started("42".to_owned())),
@@ -150,7 +108,7 @@ mod tests {
         let time_sleep_name = action_type_name(Time::sleep);
         let http_put_name = action_type_name(HttpService::put);
         let now = time::OffsetDateTime::now_utc();
-        let factory = WorkflowFactory::new(test_workflow);
+        let factory = WorkflowFactory::new(test::test_workflow);
 
         let mut workflow = factory.replay([
             (0, 0, now, Event::Started("42".to_owned())),

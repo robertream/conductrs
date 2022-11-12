@@ -1,73 +1,41 @@
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+
 use time::OffsetDateTime;
 
-use super::actions::Actions;
-use super::actions::{ActionRequestId, ActionType};
+use super::action::{ActionDropHandler, ActionRequest, ActionResult, ActionResultHandler};
+use super::actions::{ActionRequestId, ActionType, Actions};
+use super::events::{Event, EventQueue, EventRecord};
 use super::{WorkflowError, WorkflowResult};
 
-pub type EventId = u32;
-pub type Revision = u32;
-pub type EvaluationId = u32;
-
-type SubscriptionType = &'static str;
-type SubscriptionId = u32;
-type ItemRequestId = u32;
-
-#[derive(Debug, PartialEq, Clone)]
-pub enum Event {
-    Started(String),
-    Evaluated((EvaluationId, String)),
-    ActionRequested((ActionType, ActionRequestId, String)),
-    ActionResponse((ActionType, ActionRequestId, String)),
-    ActionDropped((ActionType, ActionRequestId)),
-    StreamRequested((SubscriptionType, SubscriptionId, String)),
-    StreamOpened((SubscriptionType, SubscriptionId, String)),
-    ItemRequested((SubscriptionType, SubscriptionId, ItemRequestId, String)),
-    ItemResponse((SubscriptionType, SubscriptionId, ItemRequestId, String)),
-    StreamClosed((SubscriptionType, SubscriptionId)),
-    Finished(Result<String, WorkflowError>),
-}
-
-pub type EventRecord = (EventId, Revision, time::OffsetDateTime, Event);
-
-type EventQueue = VecDeque<EventRecord>;
-
-pub struct WorkflowState {
-    now: time::OffsetDateTime,
-    last_event: u32,
-    last_revision: u32,
-    next_eval: u32,
-    replay: EventQueue,
-    pending: EventQueue,
-    pub actions: Actions,
-}
+#[derive(Clone)]
+pub struct WorkflowState(Arc<Mutex<WorkflowStateInternal>>);
 
 impl WorkflowState {
-    pub fn start(now: time::OffsetDateTime, started: String) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
+    pub fn start(now: time::OffsetDateTime, started: String) -> Self {
+        Self(Arc::new(Mutex::new(WorkflowStateInternal {
             pending: [(0, 0, now, Event::Started(started))].into(),
-            ..Self::new(now)
-        }))
+            ..WorkflowStateInternal::new(now)
+        })))
     }
 
-    pub fn replay(now: time::OffsetDateTime, replay: VecDeque<EventRecord>) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
+    pub fn replay(now: time::OffsetDateTime, replay: EventQueue) -> Self {
+        Self(Arc::new(Mutex::new(WorkflowStateInternal {
             replay,
-            ..Self::new(now)
-        }))
+            ..WorkflowStateInternal::new(now)
+        })))
     }
 
-    pub fn apply(&mut self, event: EventRecord) {
-        self.replay.push_back(event)
+    pub fn apply(&self, event: EventRecord) {
+        self.0.lock().unwrap().replay.push_back(event)
     }
 
-    pub fn record_eval(&mut self, evaluate: impl FnOnce() -> String) -> WorkflowResult<String> {
-        let eval_id = self.next_eval;
-        self.last_event += 1;
-        self.next_eval += 1;
-        let actual = (self.last_event, self.last_revision, self.now, eval_id);
-        match self.replay.pop_front() {
+    pub fn record_eval(&self, evaluate: impl FnOnce() -> String) -> WorkflowResult<String> {
+        let mut this = self.0.lock().unwrap();
+        let eval_id = this.next_eval;
+        this.last_event += 1;
+        this.next_eval += 1;
+        let actual = (this.last_event, this.last_revision, this.now, eval_id);
+        match this.replay.pop_front() {
             Some((event_id, last_revision, now, Event::Evaluated((eval_id, evaluation))))
                 if (event_id, last_revision, now, eval_id) == actual =>
             {
@@ -75,12 +43,13 @@ impl WorkflowState {
             }
             None => {
                 let evaluation = evaluate();
-                self.pending.push_back((
-                    self.last_event,
-                    self.last_revision,
-                    self.now,
+                let event = (
+                    this.last_event,
+                    this.last_revision,
+                    this.now,
                     Event::Evaluated((eval_id, evaluation.clone())),
-                ));
+                );
+                this.pending.push_back(event);
                 Ok(evaluation)
             }
             Some(expected) => Err(WorkflowError::ReplayFailed {
@@ -90,55 +59,85 @@ impl WorkflowState {
         }
     }
 
-    pub fn record_action_request(
-        &mut self,
-        action_type: ActionType,
-        request: String,
-    ) -> Result<ActionRequestId, WorkflowError> {
-        let action_id = self.actions.new_request(action_type);
-        let event = Event::ActionRequested((action_type, action_id, request));
-        self.record_event(event)?;
-        Ok(action_id)
+    pub fn record_action_request<A>(&self, request: A) -> (ActionResult<A>, ActionDropHandler)
+    where
+        for<'a> A: ActionRequest + 'a,
+    {
+        let mut this = self.0.lock().unwrap();
+        let type_name = A::type_name();
+        let result = ActionResult::new();
+        let result_handler = ActionResultHandler::new(&result);
+        let action_id = this.actions.add_action(type_name, result_handler);
+        let drop_handler = ActionDropHandler::new(self.clone(), action_id);
+        let action = serde_json::to_string(&request).unwrap();
+        this.try_this(|this| {
+            this.record_event(Event::ActionRequested((type_name, action_id, action)))
+        });
+        (result, drop_handler)
     }
 
-    pub fn record_workflow_result(
-        &mut self,
-        finished: WorkflowResult<String>,
-    ) -> WorkflowResult<()> {
-        self.record_event(Event::Finished(finished))
+    pub fn record_action_drop(&self, action_id: ActionRequestId, was_pending: bool) {
+        self.0.lock().unwrap().try_this(|this| {
+            let action_type = this.actions.remove_action(action_id)?;
+            if !was_pending {
+                return Ok(());
+            }
+            this.record_event(Event::ActionDropped((action_type, action_id)))
+        });
+    }
+
+    pub fn record_workflow_result(&self, finished: WorkflowResult<String>) -> WorkflowResult<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .record_event(Event::Finished(finished))
     }
 
     pub fn handle_action_response(
-        &mut self,
+        &self,
         now: time::OffsetDateTime,
-        action_type: &str,
+        action_type: ActionType,
         action_id: ActionRequestId,
         response: String,
     ) -> WorkflowResult<()> {
-        let (action_type, action_id) = self.actions.validate_response(action_type, action_id)?;
+        let mut this = self.0.lock().unwrap();
         let response = (action_type, action_id, response);
-        self.record_new_revision(now, Event::ActionResponse(response.clone()));
-        self.actions.apply_response(response)?;
+        this.actions.apply_response(&response)?;
+        this.record_new_revision(now, Event::ActionResponse(response));
         Ok(())
     }
 
-    pub fn drain_pending_events(&mut self) -> Vec<EventRecord> {
-        self.pending.drain(..).collect()
+    pub fn drain_pending_events(&self) -> EventQueue {
+        self.0.lock().unwrap().pending.drain(..).collect()
     }
 
-    pub(crate) fn record_event(&mut self, event: Event) -> WorkflowResult<()> {
-        self.last_event += 1;
-        let actual = (self.last_event, self.last_revision, self.now, event);
-        match self.replay.pop_front() {
-            Some(expected) if actual == expected => self.replay_next_revisions(),
-            Some(expected) => Err(WorkflowError::ReplayFailed {
-                expected: format!("{expected:?}"),
-                actual: format!("{actual:?}"),
-            }),
-            None => {
-                self.pending.push_back(actual);
-                Ok(())
-            }
+    pub fn pop_error(&self) -> Option<WorkflowError> {
+        self.0.lock().unwrap().error.take()
+    }
+}
+
+struct WorkflowStateInternal {
+    now: time::OffsetDateTime,
+    last_event: u32,
+    last_revision: u32,
+    next_eval: u32,
+    replay: EventQueue,
+    pending: EventQueue,
+    actions: Actions,
+    error: Option<WorkflowError>,
+}
+
+impl WorkflowStateInternal {
+    fn new(now: time::OffsetDateTime) -> Self {
+        Self {
+            now,
+            last_event: 0,
+            last_revision: 0,
+            next_eval: 0,
+            actions: Default::default(),
+            replay: Default::default(),
+            pending: Default::default(),
+            error: None,
         }
     }
 
@@ -161,22 +160,36 @@ impl WorkflowState {
             self.last_revision = revision;
             self.now = event_time;
             match event {
-                Event::ActionResponse(response) => self.actions.apply_response(response)?,
+                Event::ActionResponse(response) => self.actions.apply_response(&response)?,
                 _ => return Err(WorkflowError::Panic(None)),
             }
         }
         Ok(())
     }
 
-    fn new(now: time::OffsetDateTime) -> Self {
-        Self {
-            now,
-            last_event: 0,
-            last_revision: 0,
-            next_eval: 0,
-            actions: Default::default(),
-            replay: Default::default(),
-            pending: Default::default(),
+    fn record_event(&mut self, event: Event) -> WorkflowResult<()> {
+        self.last_event += 1;
+        let actual = (self.last_event, self.last_revision, self.now, event);
+        match self.replay.pop_front() {
+            Some(expected) if actual == expected => self.replay_next_revisions(),
+            Some(expected) => Err(WorkflowError::ReplayFailed {
+                expected: format!("{expected:?}"),
+                actual: format!("{actual:?}"),
+            }),
+            None => {
+                self.pending.push_back(actual);
+                Ok(())
+            }
+        }
+    }
+
+    fn try_this(&mut self, func: impl FnOnce(&mut Self) -> WorkflowResult<()>) {
+        let result = func(self);
+        if self.error.is_none() {
+            return;
+        }
+        if let Err(error) = result {
+            self.error = Some(error);
         }
     }
 }
