@@ -5,15 +5,14 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use crate::workflow::events::EventQueue;
 use futures::future::BoxFuture;
 use futures::task::{waker_ref, ArcWake};
 use futures::FutureExt;
 use serde::{de::DeserializeOwned, Serialize};
 
-use super::actions::ActionRequestId;
+use super::action::{ActionId, ActionType};
 use super::context::WorkflowContext;
-use super::events::{Event, EventRecord};
+use super::events::{Event, EventQueue, EventRecord};
 use super::state::WorkflowState;
 use super::{WorkflowError, WorkflowResult};
 
@@ -66,11 +65,15 @@ impl<'a> WorkflowFactory<'a> {
     }
 
     pub fn start(&self, now: time::OffsetDateTime, start: String) -> WorkflowResult<Workflow<'a>> {
-        (self.0)(NewWorkflow::Start(now, start))
+        self.create(NewWorkflow::Start(now, start))
     }
 
     pub fn replay(&self, replay: VecDeque<EventRecord>) -> WorkflowResult<Workflow<'a>> {
-        (self.0)(NewWorkflow::Replay(replay))
+        self.create(NewWorkflow::Replay(replay))
+    }
+
+    fn create(&self, workflow: NewWorkflow) -> WorkflowResult<Workflow<'a>> {
+        (self.0)(workflow)
     }
 }
 
@@ -89,8 +92,8 @@ impl<'a> Workflow<'a> {
     pub fn handle_action_response(
         &mut self,
         now: time::OffsetDateTime,
-        action_type: &'static str,
-        action_id: ActionRequestId,
+        action_type: ActionType,
+        action_id: ActionId,
         response: String,
     ) -> WorkflowResult<()> {
         self.state

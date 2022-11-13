@@ -1,5 +1,7 @@
-use crate::workflow::{WorkflowContext, WorkflowResult};
+use futures::future::Either;
 use reqwest::Url;
+
+use super::{WorkflowContext, WorkflowError, WorkflowResult};
 
 pub struct Time;
 
@@ -44,5 +46,9 @@ pub async fn test_workflow(context: &mut WorkflowContext, request: usize) -> Wor
     wait2.await?;
     let eval2 = context.eval(|| 100usize)?;
     std::mem::drop(sleep(days(3)));
-    http_response.await.map(|r| r.len() + eval2)
+    let drop_sleep = sleep(days(3));
+    match futures::future::select(drop_sleep, http_response).await {
+        Either::Left(_) => Err(WorkflowError::Panic(None)),
+        Either::Right((result, _)) => result.map(|r| r.len() + eval2),
+    }
 }

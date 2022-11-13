@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 
-use super::action::{ActionFuture, ActionRequest};
+use super::action::{ActionFuture, ActionRequest, ActionType};
 use super::state::WorkflowState;
 use super::WorkflowResult;
 
@@ -37,8 +37,7 @@ impl WorkflowContext {
         let state = self.0.clone();
         move |input| {
             let request = FunctionActionRequest(input, Default::default(), Default::default());
-            let (result, drop_handler) = state.record_action_request(request);
-            ActionFuture::new(result, drop_handler)
+            ActionFuture::new(state.clone(), request)
         }
     }
 }
@@ -59,14 +58,14 @@ pub struct FunctionActionRequest<
     Func,
     In: Serialize + DeserializeOwned,
     Out: Serialize + DeserializeOwned + Send,
->(In, PhantomData<Func>, PhantomData<Out>);
+>(In, PhantomData<Out>, PhantomData<Func>);
 
 impl<Func, In: Serialize + DeserializeOwned, Out: Serialize + DeserializeOwned + Send> ActionRequest
     for FunctionActionRequest<Func, In, Out>
 {
     type Response = Out;
-    fn type_name() -> &'static str {
-        type_name::<Func>()
+    fn type_name() -> ActionType {
+        type_name::<Func>().into()
     }
 }
 

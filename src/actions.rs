@@ -1,11 +1,12 @@
+use std::future::Future;
+use std::sync::Arc;
+
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::future::Future;
-use std::sync::Arc;
 
-use crate::workflow::actions::{ActionRequestId, ActionType};
+use crate::workflow::action::{ActionId, ActionType};
 
 pub trait ActionFn<'a, Ctx, In, Out>: Send + Sync {
     type Output: 'a + Future<Output = Out> + Send + Sync;
@@ -70,11 +71,11 @@ where
         self
     }
 
-    pub async fn execute(&self, action: (ActionType, ActionRequestId, String)) -> ActionResult {
+    pub async fn execute(&self, action: (ActionType, ActionId, String)) -> ActionResult {
         let (type_name, _action_id, request) = action;
         let action_fn = self
             .actions
-            .get(type_name)
+            .get(type_name.as_ref())
             .ok_or_else(|| format!("{type_name}: No action function was registered"))?;
         action_fn(request).await
     }
@@ -102,7 +103,7 @@ mod tests {
     #[rustfmt::skip]
     async fn execute_actions() {
         let actions = ActionRegistry::new(42).action(test_add);
-        let output = actions.execute(("async_workflow::actions::tests::test_add", 0, "24".to_owned())).await;
+        let output = actions.execute(("async_workflow::actions::tests::test_add".into(), 0, "24".to_owned())).await;
         assert_eq!(output, Ok("\"42 + 24 = 66\"".to_owned()));
     }
 }

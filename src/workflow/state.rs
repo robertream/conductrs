@@ -1,10 +1,8 @@
 use std::sync::{Arc, Mutex};
 
-use time::OffsetDateTime;
-
-use super::action::{ActionDropHandler, ActionRequest, ActionResult, ActionResultHandler};
-use super::actions::{ActionRequestId, ActionType, Actions};
-use super::events::{Event, EventQueue, EventRecord};
+use super::action::{ActionId, ActionRequest, ActionResult, ActionType};
+use super::actions::Actions;
+use super::events::{Event, EventQueue, EventRecord, EventTime};
 use super::{WorkflowError, WorkflowResult};
 
 #[derive(Clone)]
@@ -59,30 +57,32 @@ impl WorkflowState {
         }
     }
 
-    pub fn record_action_request<A>(&self, request: A) -> (ActionResult<A>, ActionDropHandler)
+    pub fn begin_action<A>(&self, request: &A) -> (ActionResult<A>, ActionId)
     where
         for<'a> A: ActionRequest + 'a,
     {
         let mut this = self.0.lock().unwrap();
         let type_name = A::type_name();
-        let result = ActionResult::new();
-        let result_handler = ActionResultHandler::new(&result);
-        let action_id = this.actions.add_action(type_name, result_handler);
-        let drop_handler = ActionDropHandler::new(self.clone(), action_id);
-        let action = serde_json::to_string(&request).unwrap();
+        let (result, result_handler) = ActionResult::new();
+        let action_id = this.actions.add_action(type_name.clone(), result_handler);
         this.try_this(|this| {
+            let action = serde_json::to_string(&request)?;
             this.record_event(Event::ActionRequested((type_name, action_id, action)))
         });
-        (result, drop_handler)
+        (result, action_id)
     }
 
-    pub fn record_action_drop(&self, action_id: ActionRequestId, was_pending: bool) {
+    pub fn cancel_action(&self, action_id: ActionId) {
         self.0.lock().unwrap().try_this(|this| {
             let action_type = this.actions.remove_action(action_id)?;
-            if !was_pending {
-                return Ok(());
-            }
-            this.record_event(Event::ActionDropped((action_type, action_id)))
+            this.record_event(Event::ActionCanceled((action_type, action_id)))
+        });
+    }
+
+    pub fn end_action(&self, action_id: ActionId) {
+        self.0.lock().unwrap().try_this(|this| {
+            let _ = this.actions.remove_action(action_id)?;
+            Ok(())
         });
     }
 
@@ -97,7 +97,7 @@ impl WorkflowState {
         &self,
         now: time::OffsetDateTime,
         action_type: ActionType,
-        action_id: ActionRequestId,
+        action_id: ActionId,
         response: String,
     ) -> WorkflowResult<()> {
         let mut this = self.0.lock().unwrap();
@@ -141,7 +141,7 @@ impl WorkflowStateInternal {
         }
     }
 
-    fn record_new_revision(&mut self, now: OffsetDateTime, event: Event) {
+    fn record_new_revision(&mut self, now: EventTime, event: Event) {
         self.last_event += 1;
         self.last_revision += 1;
         self.now = now;
