@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use super::action::{ActionId, ActionRequest, ActionResult, ActionType};
 use super::actions::Actions;
-use super::events::{Event, EventQueue, EventRecord, EventTime};
+use super::events::{Event, EventQueue, EventTime};
 use super::{WorkflowError, WorkflowResult};
 
 #[derive(Clone)]
@@ -23,8 +23,8 @@ impl WorkflowState {
         })))
     }
 
-    pub fn apply(&self, event: EventRecord) {
-        self.0.lock().unwrap().replay.push_back(event)
+    pub fn apply(&self, mut events: EventQueue) {
+        self.0.lock().unwrap().replay.append(&mut events)
     }
 
     pub fn record_eval(&self, evaluate: impl FnOnce() -> String) -> WorkflowResult<String> {
@@ -96,12 +96,9 @@ impl WorkflowState {
     pub fn handle_action_response(
         &self,
         now: time::OffsetDateTime,
-        action_type: ActionType,
-        action_id: ActionId,
-        response: String,
+        response: (ActionType, ActionId, String),
     ) -> WorkflowResult<()> {
         let mut this = self.0.lock().unwrap();
-        let response = (action_type, action_id, response);
         this.actions.apply_response(&response)?;
         this.record_new_revision(now, Event::ActionResponse(response));
         Ok(())

@@ -82,11 +82,11 @@ where
 }
 
 #[inline]
-pub(crate) fn action_type_name<Ctx, In, Out, Func>(_: Func) -> &'static str
+pub(crate) fn action_type_name<Ctx, In, Out, Func>(_: Func) -> ActionType
 where
     Func: for<'a> ActionFn<'a, Ctx, In, Out>,
 {
-    std::any::type_name::<Func>()
+    std::any::type_name::<Func>().into()
 }
 
 #[cfg(test)]

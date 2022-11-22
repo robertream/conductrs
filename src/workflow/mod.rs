@@ -39,37 +39,35 @@ impl From<serde_json::Error> for WorkflowError {
 mod tests {
     use pretty_assertions_sorted::assert_eq;
 
-    use super::*;
     use crate::actions::action_type_name;
-    use crate::workflow::action::ActionType;
-    use crate::workflow::events::Event;
+    use crate::workflow::events::{Event, EventTime};
     use crate::workflow::test::*;
+
+    use super::*;
 
     #[test]
     #[rustfmt::skip]
     fn start() {
-        let time_sleep_name: ActionType = action_type_name(Time::sleep).into();
-        let http_put_name: ActionType = action_type_name(HttpService::put).into();
-        let now = time::OffsetDateTime::now_utc();
+        let time_sleep_name = action_type_name(Time::sleep);
+        let http_put_name = action_type_name(HttpService::put);
+        let now = EventTime::now_utc();
         let factory = WorkflowFactory::new(test::test_workflow);
 
-        let mut workflow = factory.start(now, "42".to_string()).unwrap();
-        assert_eq!(workflow.drain_pending_events(), vec![
+        let (mut workflow, start_events) = factory.start(now, "42".to_string()).unwrap();
+        assert_eq!(start_events, vec![
             (0, 0, now, Event::Started("42".to_owned())),
             (1, 0, now, Event::Evaluated((0, "666".to_owned()))),
             (2, 0, now, Event::ActionRequested((time_sleep_name.clone(), 0, "[86400,0]".to_owned()))),
         ]);
 
         let now = now + time::Duration::seconds(1);
-        assert_eq!(workflow.handle_action_response(now, time_sleep_name.clone(), 0, "null".to_owned()), Ok(()));
-        assert_eq!(workflow.drain_pending_events(), vec![
+        assert_eq!(workflow.handle_action_response(now, (time_sleep_name.clone(), 0, "null".to_owned())).unwrap(), vec![
             (3, 1, now, Event::ActionResponse((time_sleep_name.clone(), 0, "null".to_owned()))),
             (4, 1, now, Event::ActionRequested((time_sleep_name.clone(), 1, "[172800,0]".to_owned()))),
         ]);
 
         let now = now + time::Duration::seconds(1);
-        assert_eq!(workflow.handle_action_response(now, time_sleep_name.clone(), 1, "null".to_owned()), Ok(()));
-        assert_eq!(workflow.drain_pending_events(), vec![
+        assert_eq!(workflow.handle_action_response(now, (time_sleep_name.clone(), 1, "null".to_owned())).unwrap(), vec![
             (5, 2, now, Event::ActionResponse((time_sleep_name.clone(), 1, "null".to_owned()))),
             (6, 2, now, Event::Evaluated((1, "100".to_owned()))),
             (7, 2, now, Event::ActionRequested((time_sleep_name.clone(), 2, "[259200,0]".to_owned()))),
@@ -77,8 +75,7 @@ mod tests {
         ]);
 
         let now = now + time::Duration::seconds(1);
-        assert_eq!(workflow.handle_action_response(now, http_put_name.clone(), 3, "\"24\"".to_owned()), Ok(()));
-        assert_eq!(workflow.drain_pending_events(), vec![
+        assert_eq!(workflow.handle_action_response(now, (http_put_name.clone(), 3, "\"24\"".to_owned())).unwrap(), vec![
             (9, 3, now, Event::ActionResponse((http_put_name.clone(), 3, "\"24\"".to_owned()))),
             (10, 3, now, Event::ActionCanceled((time_sleep_name.clone(), 2))),
             (11, 3, now, Event::Finished(Ok("102".to_owned()))),
@@ -88,8 +85,8 @@ mod tests {
     #[test]
     #[rustfmt::skip]
     fn replay() {
-        let time_sleep_name: ActionType = action_type_name(Time::sleep).into();
-        let http_put_name: ActionType = action_type_name(HttpService::put).into();
+        let time_sleep_name = action_type_name(Time::sleep);
+        let http_put_name = action_type_name(HttpService::put);
         let now = time::OffsetDateTime::now_utc();
         let factory = WorkflowFactory::new(test::test_workflow);
 
@@ -108,8 +105,8 @@ mod tests {
     #[test]
     #[rustfmt::skip]
     fn replay_all() {
-        let time_sleep_name: ActionType = action_type_name(Time::sleep).into();
-        let http_put_name: ActionType = action_type_name(HttpService::put).into();
+        let time_sleep_name = action_type_name(Time::sleep);
+        let http_put_name = action_type_name(HttpService::put);
         let now = time::OffsetDateTime::now_utc();
         let factory = WorkflowFactory::new(test::test_workflow);
 
@@ -124,7 +121,7 @@ mod tests {
             (7, 2, now, Event::Evaluated((1, "100".to_owned()))),
             (8, 2, now, Event::ActionRequested((time_sleep_name.clone(), 3, "[259200,0]".to_owned()))),
             (9, 3, now, Event::ActionResponse((http_put_name.clone(), 1, "\"24\"".to_owned()))),
-            (10, 2, now, Event::ActionCanceled((time_sleep_name.clone(), 3))),
+            (10, 3, now, Event::ActionCanceled((time_sleep_name.clone(), 3))),
             (11, 3, now, Event::Finished(Ok("102".to_owned()))),
         ].into()).unwrap();
 

@@ -12,18 +12,18 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use super::action::{ActionId, ActionType};
 use super::context::WorkflowContext;
-use super::events::{Event, EventQueue, EventRecord};
+use super::events::{Event, EventQueue, EventRecord, EventTime};
 use super::state::WorkflowState;
 use super::{WorkflowError, WorkflowResult};
 
-pub struct WorkflowFactory<'a>(BoxWorkflowFn<'a>);
+pub struct WorkflowFactory(BoxWorkflowFn);
 
-impl<'a> WorkflowFactory<'a> {
+impl WorkflowFactory {
     pub fn new<In, Out, Func>(func: Func) -> Self
     where
-        In: 'a + Send + DeserializeOwned,
-        Out: 'a + Serialize,
-        Func: 'a + for<'b> WorkflowFn<'b, In, Out>,
+        In: Send + DeserializeOwned,
+        Out: Serialize,
+        Func: 'static + for<'b> WorkflowFn<'b, In, Out>,
     {
         let func = Arc::new(func);
         let waker = Arc::new(EmptyWaker);
@@ -64,41 +64,41 @@ impl<'a> WorkflowFactory<'a> {
         }))
     }
 
-    pub fn start(&self, now: time::OffsetDateTime, start: String) -> WorkflowResult<Workflow<'a>> {
-        self.create(NewWorkflow::Start(now, start))
+    pub fn start(&self, now: EventTime, start: String) -> WorkflowResult<(Workflow, EventQueue)> {
+        let mut workflow = self.create(NewWorkflow::Start(now, start))?;
+        let events = workflow.drain_pending_events();
+        Ok((workflow, events))
     }
 
-    pub fn replay(&self, replay: VecDeque<EventRecord>) -> WorkflowResult<Workflow<'a>> {
+    pub fn replay(&self, replay: EventQueue) -> WorkflowResult<Workflow> {
         self.create(NewWorkflow::Replay(replay))
     }
 
-    fn create(&self, workflow: NewWorkflow) -> WorkflowResult<Workflow<'a>> {
+    fn create(&self, workflow: NewWorkflow) -> WorkflowResult<Workflow> {
         (self.0)(workflow)
     }
 }
 
-pub struct Workflow<'a> {
-    future: BoxWorkflowFuture<'a>,
+pub struct Workflow {
+    future: BoxWorkflowFuture,
     waker: Arc<EmptyWaker>,
     state: WorkflowState,
 }
 
-impl<'a> Workflow<'a> {
-    pub fn apply(&mut self, event: EventRecord) -> WorkflowResult<()> {
-        self.state.apply(event);
+impl Workflow {
+    pub fn apply(&mut self, events: VecDeque<EventRecord>) -> WorkflowResult<()> {
+        self.state.apply(events);
         self.resume()
     }
 
     pub fn handle_action_response(
         &mut self,
         now: time::OffsetDateTime,
-        action_type: ActionType,
-        action_id: ActionId,
-        response: String,
-    ) -> WorkflowResult<()> {
-        self.state
-            .handle_action_response(now, action_type, action_id, response)?;
-        self.resume()
+        response: (ActionType, ActionId, String),
+    ) -> WorkflowResult<EventQueue> {
+        self.state.handle_action_response(now, response)?;
+        self.resume()?;
+        Ok(self.state.drain_pending_events())
     }
 
     pub fn drain_pending_events(&mut self) -> EventQueue {
@@ -137,15 +137,16 @@ where
     }
 }
 
-type BoxWorkflowFuture<'a> = Mutex<BoxFuture<'a, WorkflowResult<()>>>;
+type BoxWorkflowFuture = Mutex<BoxFuture<'static, WorkflowResult<()>>>;
 
 struct EmptyWaker;
+unsafe impl Send for EmptyWaker {}
 impl ArcWake for EmptyWaker {
     fn wake_by_ref(_: &Arc<Self>) {}
 }
 
-type BoxWorkflowFn<'a> = Box<dyn Fn(NewWorkflow) -> WorkflowResult<Workflow<'a>> + 'a>;
+type BoxWorkflowFn = Box<dyn 'static + Send + Fn(NewWorkflow) -> WorkflowResult<Workflow>>;
 enum NewWorkflow {
     Start(time::OffsetDateTime, String),
-    Replay(VecDeque<EventRecord>),
+    Replay(EventQueue),
 }
